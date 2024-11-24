@@ -1,87 +1,68 @@
+use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use hound;
-use std::sync::{Arc, Mutex};
+use tracing::{error, info};
 
-fn main() -> Result<(), anyhow::Error> {
-    // Read WAV file
-    let mut reader = hound::WavReader::open("./assets/sample-0.wav")?;
-    let spec = reader.spec();
-    let wav_sample_rate = spec.sample_rate as f32;
-
-    // Convert samples to f32 based on format
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Int => match spec.bits_per_sample {
-            16 => reader
-                .samples::<i16>()
-                .map(|s| s.unwrap() as f32 / i16::MAX as f32)
-                .collect(),
-            24 | 32 => reader
-                .samples::<i32>()
-                .map(|s| s.unwrap() as f32 / i32::MAX as f32)
-                .collect(),
-            8 => reader
-                .samples::<i8>()
-                .map(|s| s.unwrap() as f32 / i8::MAX as f32)
-                .collect(),
-            _ => return Err(anyhow::anyhow!("Unsupported bit depth")),
-        },
-        hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap()).collect(),
-    };
-
-    let samples = Arc::new(Mutex::new(samples));
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
 
     let host = cpal::default_host();
     let device = host
         .default_output_device()
         .expect("no output device available");
+    info!("Default output device: {:#?}", device.name());
+
     let config = device.default_output_config()?;
-    let channels = config.channels();
-    let output_sample_rate = config.sample_rate().0 as f32;
+    info!("Default output config: {:#?}", config);
 
-    // Calculate playback speed ratio
-    let speed_ratio = wav_sample_rate / output_sample_rate;
-    let position = Arc::new(Mutex::new(0.0f32));
-
-    let samples_clone = samples.clone();
-    let position_clone = position.clone();
+    let sample_rate = config.sample_rate().0 as f32;
+    info!("Sample rate: {}", sample_rate);
 
     let stream = device.build_output_stream(
         &config.into(),
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            let samples = samples_clone.lock().unwrap();
-            let mut pos = position_clone.lock().unwrap();
+            // Iterate through each audio sample in the buffer, allowing modification
+            for sample in data.iter_mut() {
+                // Maintain phase angle across iterations using static variable
+                // Must be unsafe since it's static mut
+                static mut PHASE: f32 = 0.0;
 
-            for frame in data.chunks_mut(channels as usize) {
-                let sample_pos = *pos as usize;
-                let value = if sample_pos < samples.len() {
-                    // Linear interpolation between samples
-                    let fract = *pos - sample_pos as f32;
-                    let current = samples[sample_pos];
-                    let next = if sample_pos + 1 < samples.len() {
-                        samples[sample_pos + 1]
-                    } else {
-                        0.0
-                    };
-                    current * (1.0 - fract) + next * fract
-                } else {
-                    0.0
-                };
+                unsafe {
+                    // Set frequency to A4 note (440Hz)
+                    let frequency = 440.0;
 
-                for sample in frame.iter_mut() {
-                    *sample = value;
+                    // Calculate sample value using sine wave:
+                    // - sin(PHASE) creates the waveform
+                    // - 0.8 multiplier controls volume/amplitude
+                    *sample = PHASE.sin() * 0.8;
+
+                    // Advance phase for next sample:
+                    // - 2π * frequency gives angular velocity
+                    // - Divide by sample_rate converts to per-sample phase increment
+                    PHASE += 2.0 * std::f32::consts::PI * frequency / sample_rate;
+
+                    // Keep PHASE between 0 and 2π to prevent floating point precision loss
+                    // This is called phase wrapping
+                    if PHASE >= 2.0 * std::f32::consts::PI {
+                        PHASE -= 2.0 * std::f32::consts::PI;
+                    }
                 }
-                *pos += speed_ratio;
             }
         },
-        |err| eprintln!("Error: {}", err),
+        move |err| {
+            error!("an error occurred on the output stream: {:#?}", err);
+        },
         None,
-    )?;
+    );
 
+    info!("Starting audio playback...");
+    let stream = stream?;
     stream.play()?;
+    info!("Stream is playing. Press Ctrl+C to stop.");
 
-    while *position.lock().unwrap() < samples.lock().unwrap().len() as f32 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    // Keep the stream alive
+    tokio::signal::ctrl_c().await?;
+    info!("Stopping audio playback...");
 
     Ok(())
 }
