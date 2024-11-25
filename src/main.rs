@@ -1,3 +1,5 @@
+use std::any;
+
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use filter::AudioBandProcessor;
@@ -5,8 +7,40 @@ use tracing::{error, info};
 
 pub mod filter;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+use notan::draw::*;
+use notan::prelude::*;
+
+#[derive(AppState)]
+struct State {}
+
+#[notan_main]
+fn main() -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    runtime.spawn(run());
+
+    notan::init_with(setup)
+        .add_config(DrawConfig)
+        .update(update)
+        .draw(draw)
+        .build()
+}
+
+fn setup(gfx: &mut Graphics) -> State {
+    State {}
+}
+
+fn update(app: &mut App, state: &mut State) {}
+
+fn draw(gfx: &mut Graphics, state: &mut State) {
+    let mut draw = gfx.create_draw();
+    draw.clear(Color::BLACK);
+    gfx.render(&draw);
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let host = cpal::default_host();
@@ -86,6 +120,8 @@ async fn main() -> Result<()> {
 
     let channels = config.channels() as usize;
     let mut current_sample = 0;
+
+    let samples_len = samples.len();
     let stream = device.build_output_stream(
         &config.into(),
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -114,8 +150,13 @@ async fn main() -> Result<()> {
     stream.play()?;
     info!("Stream is playing. Press Ctrl+C to stop.");
 
-    // Keep the stream alive
-    tokio::signal::ctrl_c().await?;
+    // Wait for the stream to finish
+    loop {
+        if current_sample >= samples_len {
+            break;
+        }
+    }
+
     info!("Stopping audio playback...");
 
     Ok(())
