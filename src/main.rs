@@ -100,6 +100,17 @@ async fn run() -> Result<()> {
         })
         .collect();
 
+    // If stereo, convert to mono
+    let samples = if spec.channels == 2 {
+        let mut mono_samples = Vec::with_capacity(samples.len() / 2);
+        for chunk in samples.chunks(2) {
+            mono_samples.push((chunk[0] + chunk[1]) * 0.5);
+        }
+        mono_samples
+    } else {
+        samples
+    };
+
     // Make new samples with the correct sample rate via linear interpolation
     let mut new_samples = Vec::new();
     let output_len = (samples.len() as f32 * ratio) as usize;
