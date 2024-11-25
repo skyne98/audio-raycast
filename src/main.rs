@@ -1,6 +1,9 @@
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use filter::process_audio_bands;
 use tracing::{error, info};
+
+pub mod filter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -75,8 +78,14 @@ async fn main() -> Result<()> {
         let sample = samples[pos_floor] * (1.0 - frac) + samples[pos_ceil] * frac;
         new_samples.push(sample);
     }
+    let mut samples = new_samples;
 
-    let samples = new_samples;
+    // Apply a filter to the treble samples
+    const CHUNK_SIZE: usize = 4096;
+    let start = std::time::Instant::now();
+    process_audio_bands(&mut samples, [1.0, 0.5, 0.2, 0.1, 0.01], CHUNK_SIZE);
+    let elapsed = start.elapsed();
+    info!("Filtering took {:?}", elapsed);
 
     let channels = config.channels() as usize;
     let mut current_sample = 0;
