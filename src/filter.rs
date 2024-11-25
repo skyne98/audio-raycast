@@ -1,29 +1,45 @@
 use fundsp::hacker32::*;
 
-pub fn process_audio_bands(samples: &mut [f32], bands: [f32; 5], chunk_size: usize) {
-    let mut filters = [
-        lowpass_hz(200.0, 1.0),
-        lowpass_hz(600.0, 1.0),
-        lowpass_hz(1200.0, 1.0),
-        lowpass_hz(3000.0, 1.0),
-        lowpass_hz(20000.0, 1.0),
-    ];
+pub enum FilterType {
+    Lowpass(An<FixedSvf<f32, LowpassMode<f32>>>),
+    Bandpass(An<FixedSvf<f32, BandpassMode<f32>>>),
+    Highpass(An<FixedSvf<f32, HighpassMode<f32>>>),
+}
 
-    // Pre-allocate a single buffer and reuse it
-    let mut processed_chunk = vec![0.0; chunk_size];
+pub struct AudioBandProcessor {
+    filters: [FilterType; 5],
+    bands: [f32; 5],
+}
 
-    for chunk in samples.chunks_mut(chunk_size) {
-        // Clear the buffer instead of reallocating
-        processed_chunk[..chunk.len()].fill(0.0);
-
-        // Process all samples through each filter
-        for (filter, &adjustment) in filters.iter_mut().zip(bands.iter()) {
-            for (j, &sample) in chunk.iter().enumerate() {
-                processed_chunk[j] += adjustment * filter.filter_mono(sample);
-            }
+impl AudioBandProcessor {
+    pub fn new() -> Self {
+        Self {
+            filters: [
+                FilterType::Lowpass(lowpass_hz(200.0, 1.0)), // Low band (0 - 200 Hz)
+                FilterType::Bandpass(bandpass_hz(400.0, 1.0)), // Low-mid band (200 - 600 Hz)
+                FilterType::Bandpass(bandpass_hz(900.0, 1.0)), // Mid band (600 - 1200 Hz)
+                FilterType::Bandpass(bandpass_hz(2100.0, 1.0)), // Upper-mid band (1200 - 3000 Hz)
+                FilterType::Highpass(highpass_hz(3000.0, 1.0)), // High band (3000 Hz +)
+            ],
+            bands: [1.0; 5], // Default gain values for each band
         }
+    }
 
-        // Copy back the results
-        chunk.copy_from_slice(&processed_chunk[..chunk.len()]);
+    pub fn update_bands(&mut self, new_bands: [f32; 5]) {
+        self.bands = new_bands;
+    }
+
+    pub fn process_sample(&mut self, sample: f32) -> f32 {
+        // Accumulate the filtered output from each band
+        let mut output = 0.0;
+        for (i, filter) in self.filters.iter_mut().enumerate() {
+            let adjusted_sample = match filter {
+                FilterType::Lowpass(node) => self.bands[i] * node.filter_mono(sample),
+                FilterType::Bandpass(node) => self.bands[i] * node.filter_mono(sample),
+                FilterType::Highpass(node) => self.bands[i] * node.filter_mono(sample),
+            };
+            output += adjusted_sample;
+        }
+        output
     }
 }

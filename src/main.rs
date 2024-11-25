@@ -1,6 +1,6 @@
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use filter::process_audio_bands;
+use filter::AudioBandProcessor;
 use tracing::{error, info};
 
 pub mod filter;
@@ -80,12 +80,9 @@ async fn main() -> Result<()> {
     }
     let mut samples = new_samples;
 
-    // Apply a filter to the treble samples
-    const CHUNK_SIZE: usize = 4096;
-    let start = std::time::Instant::now();
-    process_audio_bands(&mut samples, [1.0, 0.5, 0.2, 0.1, 0.01], CHUNK_SIZE);
-    let elapsed = start.elapsed();
-    info!("Filtering took {:?}", elapsed);
+    // Apply a muffle effect to the audio
+    let mut filter = AudioBandProcessor::new();
+    filter.update_bands(/* muffle behind a door */ [1.0, 0.25, 0.0, 0.0, 0.0]);
 
     let channels = config.channels() as usize;
     let mut current_sample = 0;
@@ -94,8 +91,9 @@ async fn main() -> Result<()> {
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
             for frame in data.chunks_mut(channels) {
                 if let Some(sample) = samples.get(current_sample) {
+                    let sample = filter.process_sample(*sample);
                     for channel in frame.iter_mut() {
-                        *channel = *sample;
+                        *channel = sample;
                     }
                     current_sample += 1;
                 } else {
