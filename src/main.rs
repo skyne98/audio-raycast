@@ -1,45 +1,11 @@
-use std::any;
-
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use filter::AudioBandProcessor;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
+use std::vec::Vec;
 use tracing::{error, info};
 
-pub mod filter;
-
-use notan::draw::*;
-use notan::prelude::*;
-
-#[derive(AppState)]
-struct State {}
-
-#[notan_main]
-fn main() -> Result<(), String> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
-    runtime.spawn(run());
-
-    notan::init_with(setup)
-        .add_config(DrawConfig)
-        .update(update)
-        .draw(draw)
-        .build()
-}
-
-fn setup(gfx: &mut Graphics) -> State {
-    State {}
-}
-
-fn update(app: &mut App, state: &mut State) {}
-
-fn draw(gfx: &mut Graphics, state: &mut State) {
-    let mut draw = gfx.create_draw();
-    draw.clear(Color::BLACK);
-    gfx.render(&draw);
-}
-
+// Inside your `run()` function
 async fn run() -> Result<()> {
     tracing_subscriber::fmt::init();
 
@@ -55,120 +21,166 @@ async fn run() -> Result<()> {
     let sample_rate = config.sample_rate().0 as f32;
     info!("Sample rate: {}", sample_rate);
 
-    let file = tokio::fs::read("assets/sample-0.wav").await?;
-    let mut reader = hound::WavReader::new(&file[..])?;
-    let spec = reader.spec();
-    info!("WAV file spec: {:#?}", spec);
-    let wav_sample_rate = spec.sample_rate as f32;
-    let ratio = sample_rate / wav_sample_rate;
-    let sample_type = spec.sample_format;
-    let samples = match sample_type {
-        hound::SampleFormat::Int => {
-            let samples: Vec<i32> = reader.samples::<i32>().map(|s| s.unwrap()).collect();
-            samples
-                .iter()
-                // Normalize integer samples to [-1.0, 1.0]
-                .map(|s| *s as f32 / i32::MAX as f32)
-                .collect::<Vec<f32>>()
-        }
-        hound::SampleFormat::Float => {
-            // Float samples are already normalized
-            reader.samples::<f32>().map(|s| s.unwrap()).collect()
-        }
+    let sample_type = config.sample_format();
+    info!("Sample type: {:#?}", sample_type);
+
+    // Read sample from a file
+    let samples = hound::WavReader::open("assets/sample-0.wav")?;
+    let wav_sample_type = samples.spec().sample_format;
+    let wav_sample_rate = samples.spec().sample_rate as f32;
+    let samples: Vec<f32> = match wav_sample_type {
+        hound::SampleFormat::Float => samples.into_samples::<f32>().map(|s| s.unwrap()).collect(),
+        hound::SampleFormat::Int => samples
+            .into_samples::<i16>()
+            .map(|s| s.unwrap() as f32 / i16::MAX as f32)
+            .collect(),
     };
-    info!("Read {} samples from the WAV file", samples.len());
+    info!("Read {} samples from the file", samples.len());
 
-    let target_peak = 0.7; // Target peak amplitude (70% of max)
-    let max_amplitude = samples.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-    let auto_gain = if max_amplitude > 0.0 {
-        target_peak / max_amplitude
-    } else {
-        1.0
-    };
+    // Resample the samples to the output sample rate using linear interpolation
+    let resample_ratio = sample_rate / wav_sample_rate;
+    let resampled_length = ((samples.len() as f32) * resample_ratio) as usize;
+    let mut resampled_samples = Vec::with_capacity(resampled_length);
 
-    // Apply gain with soft limiting
-    let samples: Vec<f32> = samples
-        .iter()
-        .map(|&s| {
-            let amplified = s * auto_gain;
-            // Soft limiting to prevent harsh clipping
-            if amplified.abs() > 0.8 {
-                0.8 * amplified.signum() + 0.2 * (amplified - 0.8 * amplified.signum())
-            } else {
-                amplified
-            }
-        })
-        .collect();
-
-    // If stereo, convert to mono
-    let samples = if spec.channels == 2 {
-        let mut mono_samples = Vec::with_capacity(samples.len() / 2);
-        for chunk in samples.chunks(2) {
-            mono_samples.push((chunk[0] + chunk[1]) * 0.5);
-        }
-        mono_samples
-    } else {
-        samples
-    };
-
-    // Make new samples with the correct sample rate via linear interpolation
-    let mut new_samples = Vec::new();
-    let output_len = (samples.len() as f32 * ratio) as usize;
-    for i in 0..output_len {
-        let pos = i as f32 / ratio;
-        let pos_floor = pos.floor() as usize;
-        let pos_ceil = (pos_floor + 1).min(samples.len() - 1);
-        let frac = pos - pos_floor as f32;
-
-        let sample = samples[pos_floor] * (1.0 - frac) + samples[pos_ceil] * frac;
-        new_samples.push(sample);
+    for i in 0..resampled_length {
+        let src_index = i as f32 / resample_ratio;
+        let index_floor = src_index.floor() as usize;
+        let index_ceil = (index_floor + 1).min(samples.len() - 1);
+        let frac = src_index - index_floor as f32;
+        let sample = samples[index_floor] * (1.0 - frac) + samples[index_ceil] * frac;
+        resampled_samples.push(sample);
     }
-    let mut samples = new_samples;
+    let samples = resampled_samples;
 
-    // Apply a muffle effect to the audio
-    let mut filter = AudioBandProcessor::new();
-    filter.update_bands(/* muffle behind a door */ [1.0, 0.25, 0.0, 0.0, 0.0]);
+    // Initialize HRTF processor
+    let hrtf_sphere = hrtf::HrirSphere::from_file("assets/hrir.bin", sample_rate as u32)
+        .map_err(|e| anyhow::anyhow!("Failed to load HRTF data: {:#?}", e))?;
+    let processor = hrtf::HrtfProcessor::new(hrtf_sphere, 8, 128);
 
-    let channels = config.channels() as usize;
-    let mut current_sample = 0;
+    // Create channels for communication
+    let (input_tx, input_rx): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = mpsc::channel();
+    let (output_tx, output_rx): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = mpsc::channel();
 
-    let samples_len = samples.len();
+    // Spawn a thread to process audio chunks
+    thread::spawn(move || {
+        process_audio_chunks(processor, input_rx, output_tx);
+    });
+
+    // Spawn a thread to feed samples into the input channel
+    let samples_clone = samples.clone();
+    thread::spawn(move || {
+        let chunk_size = 1024;
+        for chunk in samples_clone.chunks(chunk_size) {
+            // Pad the last chunk with zeros
+            let chunk = if chunk.len() < chunk_size {
+                let mut padded_chunk = vec![0.0; chunk_size];
+                padded_chunk[..chunk.len()].copy_from_slice(chunk);
+                padded_chunk
+            } else {
+                chunk.to_vec()
+            };
+            if input_tx.send(chunk.to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Build the output stream
     let stream = device.build_output_stream(
         &config.into(),
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            for frame in data.chunks_mut(channels) {
-                if let Some(sample) = samples.get(current_sample) {
-                    let sample = filter.process_sample(*sample);
-                    for channel in frame.iter_mut() {
-                        *channel = sample;
+            let mut idx = 0;
+            while idx < data.len() {
+                match output_rx.recv() {
+                    Ok(buffer) => {
+                        for &sample in &buffer {
+                            if idx < data.len() {
+                                data[idx] = sample;
+                                idx += 1;
+                            } else {
+                                break;
+                            }
+                        }
                     }
-                    current_sample += 1;
-                } else {
-                    for channel in frame.iter_mut() {
-                        *channel = 0.0;
+                    Err(_) => {
+                        // No more data, fill with silence
+                        for sample in &mut data[idx..] {
+                            *sample = 0.0;
+                        }
+                        break;
                     }
                 }
             }
         },
         move |err| {
-            error!("an error occurred on the output stream: {:#?}", err);
+            error!("An error occurred on the output stream: {:#?}", err);
         },
         None,
-    );
+    )?;
 
-    info!("Starting audio playback...");
-    let stream = stream?;
     stream.play()?;
     info!("Stream is playing. Press Ctrl+C to stop.");
 
-    // Wait for the stream to finish
-    loop {
-        if current_sample >= samples_len {
+    // Wait for Ctrl+C
+    tokio::signal::ctrl_c().await?;
+
+    Ok(())
+}
+
+// Function to process audio chunks
+fn process_audio_chunks(
+    mut processor: hrtf::HrtfProcessor,
+    input_rx: Receiver<Vec<f32>>,
+    output_tx: Sender<Vec<f32>>,
+) {
+    let mut prev_left_samples = vec![];
+    let mut prev_right_samples = vec![];
+    let mut previous_sample_vector = hrtf::Vec3 {
+        x: 0.0,
+        y: 0.0,
+        z: 1.0,
+    };
+    let start_time = std::time::Instant::now();
+
+    while let Ok(buffer) = input_rx.recv() {
+        let mut output = vec![(0.0f32, 0.0f32); buffer.len()];
+
+        // Update sample vector based on time or your desired parameters
+        let time_since = start_time.elapsed().as_secs_f32();
+        let angle = time_since * std::f32::consts::TAU;
+        let new_sample_vector = hrtf::Vec3 {
+            x: angle.cos(),
+            y: angle.sin(),
+            z: 0.0,
+        };
+
+        let context = hrtf::HrtfContext {
+            source: &buffer,
+            output: &mut output,
+            new_sample_vector,
+            prev_sample_vector: previous_sample_vector,
+            prev_left_samples: &mut prev_left_samples,
+            prev_right_samples: &mut prev_right_samples,
+            new_distance_gain: 1.0,
+            prev_distance_gain: 1.0,
+        };
+
+        processor.process_samples(context);
+        previous_sample_vector = new_sample_vector;
+
+        // Flatten stereo samples into a single Vec<f32>
+        let stereo_buffer: Vec<f32> = output
+            .iter()
+            .flat_map(|&(left, right)| vec![left, right])
+            .collect();
+
+        if output_tx.send(stereo_buffer).is_err() {
             break;
         }
     }
+}
 
-    info!("Stopping audio playback...");
-
-    Ok(())
+#[tokio::main]
+async fn main() -> Result<()> {
+    run().await
 }
