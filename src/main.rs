@@ -1,13 +1,16 @@
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use filter::AudioBandProcessor;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 use std::vec::Vec;
-use std::{error, thread};
 use tracing::{error, info};
 
 const INTERPOLATION_STEPS: usize = 8;
 const BLOCK_LEN: usize = 128;
 const CHUNK: usize = INTERPOLATION_STEPS * BLOCK_LEN;
+
+mod filter;
 
 // Inside your `run()` function
 async fn run() -> Result<()> {
@@ -162,9 +165,15 @@ fn process_audio_chunks(
     let mut prev_distance_gain = 1.0;
     let start_time = std::time::Instant::now();
 
-    while let Ok(buffer) = input_rx.recv() {
-        let mut output = vec![(0.0f32, 0.0f32); buffer.len()];
+    let mut filter = AudioBandProcessor::new();
+    // Emulate a sound muffled through the door
+    filter.update_bands([0.85, 0.25, 0.01, 0.005, 0.001]);
 
+    while let Ok(buffer) = input_rx.recv() {
+        let mut filter_output = vec![0.0; buffer.len()];
+        filter.process_buffer(&buffer, &mut filter_output);
+
+        let mut output = vec![(0.0f32, 0.0f32); buffer.len()];
         // Update sample vector based on time or your desired parameters
         let time_since = start_time.elapsed().as_secs_f32();
         let time_since = time_since / 2.0; // 2 seconds for a full circle
@@ -177,7 +186,7 @@ fn process_audio_chunks(
         let distance = f32::sqrt(new_sample_vector.x.powi(2) + new_sample_vector.y.powi(2));
 
         let context = hrtf::HrtfContext {
-            source: &buffer,
+            source: &filter_output,
             output: &mut output,
             new_sample_vector,
             prev_sample_vector: previous_sample_vector,

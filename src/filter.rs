@@ -29,17 +29,38 @@ impl AudioBandProcessor {
         self.bands = new_bands;
     }
 
-    pub fn process_sample(&mut self, sample: f32) -> f32 {
-        // Accumulate the filtered output from each band
-        let mut output = 0.0;
+    pub fn process_buffer(&mut self, input: &[f32], output: &mut [f32]) {
+        // Clear the output buffer
+        output.fill(0.0);
+
+        // Process each filter
         for (i, filter) in self.filters.iter_mut().enumerate() {
-            let adjusted_sample = match filter {
-                FilterType::Lowpass(node) => self.bands[i] * node.filter_mono(sample),
-                FilterType::Bandpass(node) => self.bands[i] * node.filter_mono(sample),
-                FilterType::Highpass(node) => self.bands[i] * node.filter_mono(sample),
-            };
-            output += adjusted_sample;
+            // Create a temporary buffer for this filter's output
+            let mut temp_buffer = vec![0.0; input.len()];
+
+            // Process the entire buffer through this filter
+            match filter {
+                FilterType::Lowpass(node) => {
+                    for (j, &sample) in input.iter().enumerate() {
+                        temp_buffer[j] = self.bands[i] * node.filter_mono(sample);
+                    }
+                }
+                FilterType::Bandpass(node) => {
+                    for (j, &sample) in input.iter().enumerate() {
+                        temp_buffer[j] = self.bands[i] * node.filter_mono(sample);
+                    }
+                }
+                FilterType::Highpass(node) => {
+                    for (j, &sample) in input.iter().enumerate() {
+                        temp_buffer[j] = self.bands[i] * node.filter_mono(sample);
+                    }
+                }
+            }
+
+            // Add this filter's output to the main output buffer
+            for (out, &temp) in output.iter_mut().zip(temp_buffer.iter()) {
+                *out += temp;
+            }
         }
-        output
     }
 }
