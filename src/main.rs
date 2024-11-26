@@ -1,9 +1,13 @@
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
 use std::vec::Vec;
+use std::{error, thread};
 use tracing::{error, info};
+
+const INTERPOLATION_STEPS: usize = 8;
+const BLOCK_LEN: usize = 128;
+const CHUNK: usize = INTERPOLATION_STEPS * BLOCK_LEN;
 
 // Inside your `run()` function
 async fn run() -> Result<()> {
@@ -53,9 +57,9 @@ async fn run() -> Result<()> {
     let samples = resampled_samples;
 
     // Initialize HRTF processor
-    let hrtf_sphere = hrtf::HrirSphere::from_file("assets/hrir.bin", sample_rate as u32)
+    let hrtf_sphere = hrtf::HrirSphere::from_file("assets/hrir-1.bin", sample_rate as u32)
         .map_err(|e| anyhow::anyhow!("Failed to load HRTF data: {:#?}", e))?;
-    let processor = hrtf::HrtfProcessor::new(hrtf_sphere, 8, 128);
+    let processor = hrtf::HrtfProcessor::new(hrtf_sphere, INTERPOLATION_STEPS, BLOCK_LEN);
 
     // Create channels for communication
     let (input_tx, input_rx): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = mpsc::channel();
@@ -69,7 +73,7 @@ async fn run() -> Result<()> {
     // Spawn a thread to feed samples into the input channel
     let samples_clone = samples.clone();
     thread::spawn(move || {
-        let chunk_size = 1024;
+        let chunk_size = CHUNK;
         for chunk in samples_clone.chunks(chunk_size) {
             // Pad the last chunk with zeros
             let chunk = if chunk.len() < chunk_size {
@@ -86,24 +90,39 @@ async fn run() -> Result<()> {
     });
 
     // Build the output stream
+    let mut leftover: Vec<f32> = Vec::new();
     let stream = device.build_output_stream(
         &config.into(),
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
             let mut idx = 0;
+            // Use leftover data first
+            if !leftover.is_empty() {
+                let len = leftover.len().min(data.len());
+                data[..len].copy_from_slice(&leftover[..len]);
+                idx += len;
+                leftover.drain(..len);
+            }
+            // Keep fetching buffers until we fill 'data' or no more data is available
             while idx < data.len() {
-                match output_rx.recv() {
+                match output_rx.try_recv() {
                     Ok(buffer) => {
-                        for &sample in &buffer {
-                            if idx < data.len() {
-                                data[idx] = sample;
-                                idx += 1;
-                            } else {
-                                break;
-                            }
+                        let len = buffer.len().min(data.len() - idx);
+                        data[idx..idx + len].copy_from_slice(&buffer[..len]);
+                        idx += len;
+                        // Store any extra data for the next callback
+                        if len < buffer.len() {
+                            leftover.extend_from_slice(&buffer[len..]);
                         }
                     }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        // No data available, fill the rest with silence to prevent underflow
+                        for sample in &mut data[idx..] {
+                            *sample = 0.0;
+                        }
+                        break;
+                    }
                     Err(_) => {
-                        // No more data, fill with silence
+                        // Channel disconnected, fill the rest with silence
                         for sample in &mut data[idx..] {
                             *sample = 0.0;
                         }
@@ -140,6 +159,7 @@ fn process_audio_chunks(
         y: 0.0,
         z: 1.0,
     };
+    let mut prev_distance_gain = 1.0;
     let start_time = std::time::Instant::now();
 
     while let Ok(buffer) = input_rx.recv() {
@@ -147,12 +167,14 @@ fn process_audio_chunks(
 
         // Update sample vector based on time or your desired parameters
         let time_since = start_time.elapsed().as_secs_f32();
+        let time_since = time_since / 2.0; // 2 seconds for a full circle
         let angle = time_since * std::f32::consts::TAU;
         let new_sample_vector = hrtf::Vec3 {
             x: angle.cos(),
             y: angle.sin(),
             z: 0.0,
         };
+        let distance = f32::sqrt(new_sample_vector.x.powi(2) + new_sample_vector.y.powi(2));
 
         let context = hrtf::HrtfContext {
             source: &buffer,
@@ -161,12 +183,13 @@ fn process_audio_chunks(
             prev_sample_vector: previous_sample_vector,
             prev_left_samples: &mut prev_left_samples,
             prev_right_samples: &mut prev_right_samples,
-            new_distance_gain: 1.0,
-            prev_distance_gain: 1.0,
+            new_distance_gain: distance,
+            prev_distance_gain: prev_distance_gain,
         };
 
         processor.process_samples(context);
         previous_sample_vector = new_sample_vector;
+        prev_distance_gain = distance;
 
         // Flatten stereo samples into a single Vec<f32>
         let stereo_buffer: Vec<f32> = output
