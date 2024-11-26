@@ -58,7 +58,7 @@ async fn run() -> Result<()> {
     }
 
     // Initialize HRTF processor
-    let hrtf_sphere = hrtf::HrirSphere::from_file("assets/hrir-1.bin", sample_rate as u32)
+    let hrtf_sphere = hrtf::HrirSphere::from_file("assets/hrir-3.bin", sample_rate as u32)
         .map_err(|e| anyhow::anyhow!("Failed to load HRTF data: {:#?}", e))?;
     let processor = hrtf::HrtfProcessor::new(hrtf_sphere, INTERPOLATION_STEPS, BLOCK_LEN);
 
