@@ -24,40 +24,38 @@ async fn run() -> Result<()> {
 
     let config = device.default_output_config()?;
     info!("Default output config: {:#?}", config);
-
     let sample_rate = config.sample_rate().0 as f32;
-    info!("Sample rate: {}", sample_rate);
-
-    let sample_type = config.sample_format();
-    info!("Sample type: {:#?}", sample_type);
 
     // Read sample from a file
     let samples = hound::WavReader::open("assets/sample-0.wav")?;
     let wav_sample_type = samples.spec().sample_format;
     let wav_sample_rate = samples.spec().sample_rate as f32;
+    let spec = samples.spec();
     let samples: Vec<f32> = match wav_sample_type {
-        hound::SampleFormat::Float => samples.into_samples::<f32>().map(|s| s.unwrap()).collect(),
+        hound::SampleFormat::Float => samples
+            .into_samples::<f32>()
+            .filter_map(Result::ok)
+            .collect(),
         hound::SampleFormat::Int => samples
             .into_samples::<i16>()
-            .map(|s| s.unwrap() as f32 / i16::MAX as f32)
+            .filter_map(Result::ok)
+            .map(|s| s as f32 / i16::MAX as f32)
             .collect(),
     };
-    info!("Read {} samples from the file", samples.len());
+    info!("Audio sample spec: {:#?}", spec);
 
-    // Resample the samples to the output sample rate using linear interpolation
+    // Resample to the output sample rate linear interpolation
     let resample_ratio = sample_rate / wav_sample_rate;
     let resampled_length = ((samples.len() as f32) * resample_ratio) as usize;
     let mut resampled_samples = Vec::with_capacity(resampled_length);
-
     for i in 0..resampled_length {
         let src_index = i as f32 / resample_ratio;
         let index_floor = src_index.floor() as usize;
         let index_ceil = (index_floor + 1).min(samples.len() - 1);
-        let frac = src_index - index_floor as f32;
-        let sample = samples[index_floor] * (1.0 - frac) + samples[index_ceil] * frac;
+        let weight = src_index - index_floor as f32;
+        let sample = samples[index_floor] * (1.0 - weight) + samples[index_ceil] * weight;
         resampled_samples.push(sample);
     }
-    let samples = resampled_samples;
 
     // Initialize HRTF processor
     let hrtf_sphere = hrtf::HrirSphere::from_file("assets/hrir-1.bin", sample_rate as u32)
@@ -70,11 +68,11 @@ async fn run() -> Result<()> {
 
     // Spawn a thread to process audio chunks
     thread::spawn(move || {
-        process_audio_chunks(processor, input_rx, output_tx);
+        process_audio_chunks(processor, input_rx, output_tx, sample_rate);
     });
 
     // Spawn a thread to feed samples into the input channel
-    let samples_clone = samples.clone();
+    let samples_clone = resampled_samples.clone();
     thread::spawn(move || {
         let chunk_size = CHUNK;
         for chunk in samples_clone.chunks(chunk_size) {
@@ -154,6 +152,7 @@ fn process_audio_chunks(
     mut processor: hrtf::HrtfProcessor,
     input_rx: Receiver<Vec<f32>>,
     output_tx: Sender<Vec<f32>>,
+    sample_rate: f32,
 ) {
     let mut prev_left_samples = vec![];
     let mut prev_right_samples = vec![];
@@ -163,21 +162,23 @@ fn process_audio_chunks(
         z: 1.0,
     };
     let mut prev_distance_gain = 1.0;
-    let start_time = std::time::Instant::now();
 
     let mut filter = AudioBandProcessor::new();
-    // Emulate a sound muffled through the door
     filter.update_bands([0.85, 0.25, 0.01, 0.005, 0.001]);
 
+    // Track total samples processed
+    let mut total_samples = 0;
+    const ROTATIONS_PER_SECOND: f32 = 0.5;
     while let Ok(buffer) = input_rx.recv() {
         let mut filter_output = vec![0.0; buffer.len()];
         filter.process_buffer(&buffer, &mut filter_output);
 
         let mut output = vec![(0.0f32, 0.0f32); buffer.len()];
-        // Update sample vector based on time or your desired parameters
-        let time_since = start_time.elapsed().as_secs_f32();
-        let time_since = time_since / 2.0; // 2 seconds for a full circle
-        let angle = time_since * std::f32::consts::TAU;
+
+        // Calculate angle based on sample position
+        let time_in_seconds = total_samples as f32 / sample_rate;
+        let angle = time_in_seconds * ROTATIONS_PER_SECOND * std::f32::consts::TAU;
+
         let new_sample_vector = hrtf::Vec3 {
             x: angle.cos(),
             y: angle.sin(),
@@ -200,11 +201,13 @@ fn process_audio_chunks(
         previous_sample_vector = new_sample_vector;
         prev_distance_gain = distance;
 
-        // Flatten stereo samples into a single Vec<f32>
         let stereo_buffer: Vec<f32> = output
             .iter()
             .flat_map(|&(left, right)| vec![left, right])
             .collect();
+
+        // Update total samples processed
+        total_samples += buffer.len();
 
         if output_tx.send(stereo_buffer).is_err() {
             break;
