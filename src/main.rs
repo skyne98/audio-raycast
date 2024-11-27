@@ -7,10 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
-use tokio::runtime::Runtime;
 use tokio::sync::watch;
 
-mod filter;
+pub mod audio;
+pub mod filter;
 
 const MOVE_SPEED: f32 = 5.0;
 const LOOK_SPEED: f32 = 0.1;
